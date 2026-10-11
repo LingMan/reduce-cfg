@@ -28,19 +28,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         "input does not reproduce"
     );
 
-    let mut cfg = candidate.into();
+    let mut cfg: Cfg = candidate.into();
     let mut pos = 0;
     let mut changed = false;
+    let mut candidates_tested = Vec::with_capacity(cfg.lines.len());
     loop {
         let candidates = candidates(&cfg, pos);
         let mut hit = None;
+        let mut test_count = 0;
 
         for candidate in candidates.into_iter() {
+            test_count = test_count + 1;
             if let (true, candidate_path) = interesting(&command, &command_args, &candidate.1)? {
                 hit = Some((candidate, candidate_path));
                 break;
             }
         }
+
+        candidates_tested.push(test_count);
 
         if let Some((hit, hit_path)) = hit {
             (pos, cfg, changed) = (hit.0, hit.1.into(), true);
@@ -53,6 +58,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         } else {
             break;
         }
+    }
+
+    println!();
+    println!("Reduction steps: {}", candidates_tested.len());
+    while let Some(&lowest) = candidates_tested.iter().min() {
+        let old_len = candidates_tested.len();
+        candidates_tested = candidates_tested.iter().filter(|c| **c != lowest).map(|n| *n).collect();
+        let count_lowest_iters = old_len - candidates_tested.len();
+        println!("Number of steps testing {lowest} candidates: {count_lowest_iters}");
     }
 
     Ok(())
