@@ -3,7 +3,6 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::fs::File;
 use std::io::BufWriter;
 use std::io::Write;
 use std::iter;
@@ -11,6 +10,7 @@ use std::process::Command;
 use std::process::Stdio;
 use std::str::FromStr;
 use tempfile::NamedTempFile;
+use tempfile::TempPath;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args_os();
@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let candidate = content.parse()?;
 
     assert!(
-        interesting(&command, &command_args, &candidate)?,
+        interesting(&command, &command_args, &candidate)?.0,
         "input does not reproduce"
     );
 
@@ -36,20 +36,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut hit = None;
 
         for candidate in candidates.into_iter() {
-            if interesting(&command, &command_args, &candidate.1)? {
-                hit = Some(candidate);
+            if let (true, candidate_path) = interesting(&command, &command_args, &candidate.1)? {
+                hit = Some((candidate, candidate_path));
                 break;
             }
         }
 
-        if let Some(hit) = hit {
+        if let Some((hit, hit_path)) = hit {
             (pos, cfg, changed) = (hit.0, hit.1.into(), true);
 
-            let mut buffer = BufWriter::new(File::create(&out_path)?);
-
-            buffer.write_all(cfg.to_string().as_bytes())?;
-
-            buffer.flush()?;
+            std::fs::copy(&hit_path, &out_path)?;
 
             println!("{} lines", cfg.lines.len());
         } else if changed {
@@ -66,7 +62,7 @@ fn interesting(
     command: &OsString,
     command_args: &[OsString],
     cfg: &CfgCandidate,
-) -> Result<bool, Box<dyn Error>> {
+) -> Result<(bool, TempPath), Box<dyn Error>> {
     let mut command = Command::new(command);
     let mut buffer = BufWriter::new(NamedTempFile::new()?);
 
@@ -82,11 +78,7 @@ fn interesting(
         .status()?
         .success();
 
-    // Trigger a compile error if `path` gets dropped too early and thus
-    // the temp file gets deleted before the command can access it.
-    // Would happen if we accidentially passed `path` by value.
-    drop(path);
-    Ok(!res)
+    Ok((!res, path))
 }
 
 fn candidates(cfg: &Cfg, start_position: usize) -> Vec<(usize, CfgCandidate<'_>)> {
@@ -256,16 +248,6 @@ impl FromStr for Node {
             ("n", num) => Ok(Node::Normal(num.parse()?)),
             _ => Err(format!("Unexpected node: {s}").into()),
         }
-    }
-}
-
-impl fmt::Display for Cfg {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        for line in &self.lines {
-            writeln!(f, "{line}")?;
-        }
-
-        Ok(())
     }
 }
 
