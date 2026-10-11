@@ -21,13 +21,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let command_args = args.collect::<Vec<_>>();
 
     let content = fs::read_to_string(&in_path).expect("Failed to read input");
-    let mut cfg: Cfg = content.parse()?;
+    let candidate = content.parse()?;
 
     assert!(
-        interesting(&command, &command_args, &cfg)?,
+        interesting(&command, &command_args, &candidate)?,
         "input does not reproduce"
     );
 
+    let mut cfg = candidate.into();
     let mut pos = 0;
     let mut changed = false;
     loop {
@@ -42,7 +43,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         if let Some(hit) = hit {
-            (pos, cfg, changed) = (hit.0, hit.1, true);
+            (pos, cfg, changed) = (hit.0, hit.1.into(), true);
 
             let mut buffer = BufWriter::new(File::create(&out_path)?);
 
@@ -64,7 +65,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn interesting(
     command: &OsString,
     command_args: &[OsString],
-    cfg: &Cfg,
+    cfg: &CfgCandidate,
 ) -> Result<bool, Box<dyn Error>> {
     let mut command = Command::new(command);
     let mut buffer = BufWriter::new(NamedTempFile::new()?);
@@ -88,65 +89,41 @@ fn interesting(
     Ok(!res)
 }
 
-fn candidates(cfg: &Cfg, start_position: usize) -> Vec<(usize, Cfg)> {
+fn candidates(cfg: &Cfg, start_position: usize) -> Vec<(usize, CfgCandidate<'_>)> {
     let mut candidates = Vec::new();
 
     for (i, line) in cfg.lines.iter().enumerate().skip(start_position) {
         let (before, after) = (&cfg.lines[..i], &cfg.lines[i + 1..]);
 
-        macro_rules! push_candidate {
-            ($new_line:expr) => {
-                let candidate_lines =
-                    iter::chain(before, iter::chain(iter::once(&$new_line), after))
-                        .cloned()
-                        .collect();
-                candidates.push((
-                    i,
-                    Cfg {
-                        lines: candidate_lines,
-                    },
-                ))
-            };
-        }
-
         match line {
             Line::Sideeffect(_) => {
-                let candidate = Cfg {
-                    lines: iter::chain(before, after).cloned().collect(),
-                };
+                let candidate = CfgCandidate::Single(before, None, after);
                 candidates.push((i, candidate))
             }
             Line::C(n1, n2, n3) => {
                 for target in [n2, n3] {
-                    push_candidate!(Line::B(*n1, *target));
+                    let candidate =
+                        CfgCandidate::Single(before, Some(Line::B(*n1, *target)), after);
+                    candidates.push((i, candidate))
                 }
             }
             Line::Switch(nodes) => {
                 if nodes.len() > 4 {
                     for k in 2..nodes.len() {
-                        // Benchmarked it. Using the push_candidate macro here is
-                        //a good 10s slower on my machine for some reason.
                         let new_line = Line::Switch({
                             let mut tmp = nodes.clone();
                             tmp.remove(k);
                             tmp
                         });
-                        let candidate_lines = [before, &[new_line], after]
-                            .into_iter()
-                            .flatten()
-                            .cloned()
-                            .collect();
-                        candidates.push((
-                            i,
-                            Cfg {
-                                lines: candidate_lines,
-                            },
-                        ))
+
+                        let candidate = CfgCandidate::Single(before, Some(new_line), after);
+                        candidates.push((i, candidate))
                     }
                 }
                 let n1 = nodes[0];
                 for target in nodes.iter().skip(1) {
-                    push_candidate!(Line::B(n1, *target));
+                    let candidate = CfgCandidate::Single(before, Some(Line::B(n1, *target)), after);
+                    candidates.push((i, candidate))
                 }
             }
             Line::B(a, x) if *a != Node::Entry && a != x => {
@@ -176,12 +153,7 @@ fn candidates(cfg: &Cfg, start_position: usize) -> Vec<(usize, Cfg)> {
                         }
                     }
                 }
-                candidates.push((
-                    i,
-                    Cfg {
-                        lines: candidate_lines,
-                    },
-                ))
+                candidates.push((i, CfgCandidate::All(candidate_lines)))
             }
             _ => (),
         }
@@ -192,6 +164,11 @@ fn candidates(cfg: &Cfg, start_position: usize) -> Vec<(usize, Cfg)> {
 
 struct Cfg {
     lines: Vec<Line>,
+}
+
+enum CfgCandidate<'a> {
+    Single(&'a [Line], Option<Line>, &'a [Line]),
+    All(Vec<Line>),
 }
 
 #[derive(Clone)]
@@ -208,7 +185,7 @@ enum Node {
     Normal(u32),
 }
 
-impl FromStr for Cfg {
+impl FromStr for CfgCandidate<'_> {
     type Err = Box<dyn Error>;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -219,7 +196,26 @@ impl FromStr for Cfg {
             .map(str::parse)
             .collect::<Result<_, _>>()?;
 
-        Ok(Cfg { lines })
+        Ok(CfgCandidate::All(lines))
+    }
+}
+
+impl From<Cfg> for CfgCandidate<'_> {
+    fn from(candidate: Cfg) -> Self {
+        CfgCandidate::All(candidate.lines)
+    }
+}
+
+impl From<CfgCandidate<'_>> for Cfg {
+    fn from(candidate: CfgCandidate) -> Self {
+        match candidate {
+            CfgCandidate::Single(before, new_line, after) => Cfg {
+                lines: iter::chain(before, iter::chain(new_line.iter(), after))
+                    .cloned()
+                    .collect(),
+            },
+            CfgCandidate::All(lines) => Cfg { lines },
+        }
     }
 }
 
@@ -268,6 +264,26 @@ impl fmt::Display for Cfg {
         for line in &self.lines {
             writeln!(f, "{line}")?;
         }
+
+        Ok(())
+    }
+}
+
+impl fmt::Display for CfgCandidate<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            CfgCandidate::Single(before, new_line, after) => {
+                for line in iter::chain(*before, iter::chain(new_line, *after)) {
+                    writeln!(f, "{line}")?;
+                }
+            }
+            CfgCandidate::All(lines) => {
+                for line in lines {
+                    writeln!(f, "{line}")?;
+                }
+            }
+        }
+
         Ok(())
     }
 }
